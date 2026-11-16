@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "items": [
+    {
+      "id": "demo-001",
+      "format": "reel",
+      "stage": "language",
+      "status": "active",
+      "created": "2026-01-05T09:00:00Z",
+      "notes": "Invented demo item: three tips for tidy notes",
+      "gates": [
+        { "stage": "script", "result": "pass", "date": "2026-01-05T09:10:00Z",
+          "detail": "files ok (1)" },
+        { "stage": "language", "result": "fail", "date": "2026-01-05T09:20:00Z",
+          "command": "{cmd:lahja} --pack {pack} -- {itempath:script.md}",
+          "detail": "command exit 2: 1 error finding" }
+      ],
+      "artifacts": ["Loom/items/demo-001/script.md"],
+      "approvals": [],
+      "events": [
+        { "date": "2026-01-05T09:12:00Z", "action": "advance", "result": "ok",
+          "detail": "demo-001 moved script -> language" }
+      ]
+    },
+    {
+      "id": "demo-002",
+      "format": "reel",
+      "stage": "script",
+      "status": "active",
+      "created": "2026-01-06T10:00:00Z",
+      "gates": [],
+      "artifacts": [],
+      "approvals": [],
+      "events": []
+    }
+  ]
+}

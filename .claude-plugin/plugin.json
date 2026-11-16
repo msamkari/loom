@@ -1,0 +1,8 @@
+{
+  "name": "loom",
+  "version": "0.1.0",
+  "description": "Content-pipeline orchestrator. One config per project (formats, stages, gates, channels), an explicit per-item ledger, deterministic gates (commands such as a dialect linter, facts expiry, required files, ticked checklists), configured build and draft-staging adapters, and publish or schedule only after a recorded approval. Dry-run adoption with snapshot, shadow mode and rollback. Python standard library only.",
+  "license": "MIT",
+  "keywords": ["content", "pipeline", "workflow", "ledger", "gates", "approval", "social-media"],
+  "author": { "name": "Mohammad Samkari", "url": "https://github.com/msamkari" }
+}

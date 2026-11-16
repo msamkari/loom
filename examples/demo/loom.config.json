@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "project_kind": "demo",
+  "pack": "saudi",
+  "shadow_mode": false,
+  "excluded_folders": ["Drafts_Private"],
+  "identity": { "voice_notes": "Docs/voice_notes.md" },
+  "channels": ["demo_channel"],
+  "approval_ttl_hours": 72,
+  "commands": {
+    "lahja": ["python", "path/to/lahja/scripts/lahja.py"],
+    "lahja_voice": ["python", "path/to/lahja-voice/scripts/lahja_voice.py"]
+  },
+  "formats": {
+    "reel": {
+      "stages": [
+        { "name": "script",
+          "checks": [{ "type": "files", "paths": ["Loom/items/{item}/script.md"] }] },
+        { "name": "language",
+          "checks": [
+            { "type": "files", "paths": ["Loom/items/{item}/script.md"] },
+            { "type": "command", "pass_codes": [0], "timeout": 60,
+              "argv": ["{cmd:lahja}", "--pack", "{pack}", "--", "{itempath:script.md}"] }
+          ] },
+        { "name": "research",
+          "checks": [{ "type": "facts", "file": "Loom/items/{item}/facts.json" }] },
+        { "name": "voice", "requires_approval": true,
+          "checks": [{ "type": "checklist", "file": "Loom/items/{item}/pre_voice.md" }] },
+        { "name": "package",
+          "checks": [{ "type": "files", "paths": ["Loom/items/{item}/caption.md"] }] },
+        { "name": "publish", "requires_approval": true }
+      ]
+    }
+  },
+  "adapters": {
+    "build": {
+      "voice_dry": {
+        "argv": ["{cmd:lahja_voice}", "dry", "--", "{itempath:script.md}"],
+        "timeout": 120,
+        "env": []
+      }
+    },
+    "stage": {
+      "draft": {
+        "argv": ["python", "tools/make_draft.py", "{item}", "{channel}"],
+        "timeout": 120,
+        "env": ["DEMO_STAGING_TOKEN"]
+      }
+    },
+    "publish": {
+      "post": {
+        "argv": ["python", "tools/publish.py", "{item}", "{channel}"],
+        "timeout": 120,
+        "env": ["DEMO_STAGING_TOKEN"],
+        "allowed_stages": ["publish"]
+      }
+    },
+    "schedule": {
+      "later": {
+        "argv": ["python", "tools/publish.py", "{item}", "{channel}", "{when}"],
+        "timeout": 120,
+        "env": ["DEMO_STAGING_TOKEN"],
+        "allowed_stages": ["publish"]
+      }
+    }
+  }
+}
