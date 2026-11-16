@@ -35,7 +35,7 @@ class PackageTests(unittest.TestCase):
     def test_manifest(self):
         m = json.loads(read(".claude-plugin/plugin.json"))
         self.assertEqual(m["name"], "loom")
-        self.assertEqual(m["version"], "0.1.0")
+        self.assertEqual(m["version"], "0.1.1")
         self.assertEqual(m["license"], "MIT")
         self.assertNotIn("icon", m)
 
@@ -81,6 +81,28 @@ class PackageTests(unittest.TestCase):
         for bad in ("removeprefix", "removesuffix", "match ", ":= "):
             self.assertNotIn(bad, src.replace("# ", ""))
         self.assertIsNone(re.search(r"\bdict\[|\blist\[|\btuple\[", src))
+
+    def test_python38_grammar_for_script_and_tests(self):
+        import ast
+        for rel in ("scripts/loom.py", "tests/helpers.py", "tests/test_trust.py", "tests/test_exec.py",
+                    "tests/test_output.py", "tests/test_recovery.py"):
+            ast.parse(read(rel), feature_version=(3, 8))
+
+    def test_skills_document_trust_and_keep_allowed_tools(self):
+        t = read("skills/loom/SKILL.md")
+        self.assertIn("`trust`", t)
+        self.assertIn("not pre-approved", t)
+        self.assertIn("reviewed", t)
+        self.assertNotIn("loom.py trust", t.split("---", 2)[1])
+        self.assertIn("trust", read("skills/loom-adopt/SKILL.md"))
+
+    def test_readme_claims_and_install_line(self):
+        r = read("README.md")
+        self.assertIn("/plugin marketplace add msamkari/samkari-plugins", r)
+        self.assertIn("/plugin install loom@samkari-plugins", r)
+        self.assertIn("trust", r)
+        self.assertNotIn("never a shell (a shell as the program is refused)", r)
+        self.assertIn("Known limits", read("CHANGELOG.md"))
 
     def test_no_third_party_imports(self):
         import sys

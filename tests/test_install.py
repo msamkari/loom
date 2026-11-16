@@ -171,9 +171,9 @@ class AdoptTests(Base):
         snaps = [d for d in os.listdir(os.path.join(self.root, "Jobs", "_Archive")) if d.startswith("loom_pre_adopt_")]
         self.assertEqual(len(snaps), 1)
         base = "Jobs/_Archive/" + snaps[0] + "/"
-        for rel in ("CLAUDE.md", "MDs/HANDOVER.md", "Jobs/state_manifest.json",
-                    ".claude/settings.json", ".claude/settings.local.json"):
+        for rel in ("CLAUDE.md", "MDs/HANDOVER.md", "Jobs/state_manifest.json", ".claude/settings.json"):
             self.assertEqual(self.r(base + rel), self.r(rel))
+        self.assertFalse(self.exists(base + ".claude/settings.local.json"))  # secret-like: never copied
         self.assertTrue(self.jr("loom.config.json")["shadow_mode"])
         m = self.jr("Loom/install_manifest.json")
         self.assertEqual(m["mode"], "adopt")
@@ -195,7 +195,7 @@ class AdoptTests(Base):
     def test_second_snapshot_gets_suffix(self):
         os.environ["LOOM_NOW"] = "2026-05-05T00:00:00Z"
         self.run_ok("adopt", "--yes")
-        os.remove(os.path.join(self.root, "loom.config.json"))
+        self.run_ok("rollback", "--yes")
         self.run_ok("adopt", "--yes")
         names = sorted(os.listdir(os.path.join(self.root, "Jobs", "_Archive")))
         self.assertEqual(names, ["loom_pre_adopt_2026-05-05", "loom_pre_adopt_2026-05-05a"])
@@ -376,7 +376,7 @@ class ConcurrencyTests(Base):
         self.assertEqual(codes, [0] * 8)
         ids = sorted(i["id"] for i in self.ledger()["items"])
         self.assertEqual(ids, sorted("p%d" % i for i in range(8)))
-        self.assertFalse(os.path.exists(os.path.join(self.root, loom.LOCK_NAME)))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "Loom", loom.LOCK_NAME)))
 
     def test_processes_race_on_one_approval(self):
         self.add_item("ep1")
@@ -394,7 +394,7 @@ class ConcurrencyTests(Base):
 
     def test_stale_lock_recovered_by_cli(self):
         import time
-        lp = os.path.join(self.root, loom.LOCK_NAME)
+        lp = os.path.join(self.root, "Loom", loom.LOCK_NAME)
         os.mkdir(lp)
         old = time.time() - 600
         os.utime(lp, (old, old))
@@ -403,7 +403,7 @@ class ConcurrencyTests(Base):
         self.assertEqual(rc, 0, e)
 
     def test_live_lock_times_out_cleanly(self):
-        os.mkdir(os.path.join(self.root, loom.LOCK_NAME))
+        os.mkdir(os.path.join(self.root, "Loom", loom.LOCK_NAME))
         rc, o, e = self.run_sub("add", "s1", "--format", "demo", "--root", self.root,
                                 env={"LOOM_LOCK_TIMEOUT": "0.5"})
         self.assertEqual(rc, 1)
@@ -415,7 +415,7 @@ class CliTests(Base):
     def test_version_and_help(self):
         rc, o, e = self.run_sub("--version")
         self.assertEqual(rc, 0)
-        self.assertIn("0.1.0", o)
+        self.assertIn("0.1.1", o)
 
     def test_no_subcommand_is_error(self):
         self.assertEqual(self.run_sub()[0], 1)

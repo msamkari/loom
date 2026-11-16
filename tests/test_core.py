@@ -107,6 +107,11 @@ class IoTests(Base):
 
 
 class LockTests(Base):
+    def setUp(self):
+        Base.setUp(self)
+        os.makedirs(os.path.join(self.root, "Loom"))
+        self.lp = os.path.join(self.root, "Loom", loom.LOCK_NAME)
+
     def test_lock_excludes_and_releases(self):
         with loom.Lock(self.root):
             os.environ["LOOM_LOCK_TIMEOUT"] = "0.3"
@@ -115,10 +120,10 @@ class LockTests(Base):
                     pass
         with loom.Lock(self.root):
             pass
-        self.assertFalse(os.path.exists(os.path.join(self.root, loom.LOCK_NAME)))
+        self.assertFalse(os.path.exists(self.lp))
 
     def test_stale_lock_is_broken(self):
-        lp = os.path.join(self.root, loom.LOCK_NAME)
+        lp = self.lp
         os.mkdir(lp)
         old = time.time() - 3600
         os.utime(lp, (old, old))
@@ -126,10 +131,10 @@ class LockTests(Base):
         with loom.Lock(self.root):
             self.assertTrue(os.path.isdir(lp))
         self.assertFalse(os.path.exists(lp))
-        self.assertEqual([n for n in os.listdir(self.root) if "stale" in n], [])
+        self.assertEqual([n for n in os.listdir(os.path.dirname(lp)) if "stale" in n], [])
 
     def test_fresh_lock_not_broken(self):
-        os.mkdir(os.path.join(self.root, loom.LOCK_NAME))
+        os.mkdir(self.lp)
         os.environ["LOOM_LOCK_TIMEOUT"] = "0.3"
         with self.assertRaises(loom.LoomError) as c:
             with loom.Lock(self.root):
@@ -141,7 +146,7 @@ class LockTests(Base):
         a.__enter__()
         a.token = "someone-else"
         a.__exit__()
-        self.assertTrue(os.path.isdir(os.path.join(self.root, loom.LOCK_NAME)))
+        self.assertTrue(os.path.isdir(self.lp))
 
 
 class ConfigSchemaTests(Base):
@@ -180,10 +185,10 @@ class ConfigSchemaTests(Base):
         self.bad(c)
 
     def test_shell_refused_as_command(self):
-        for sh in ("bash", "sh", "cmd", "cmd.exe", "powershell", "pwsh", "/bin/sh"):
+        for sh in ("bash", "sh", "cmd", "cmd.exe", "powershell", "pwsh", "/bin/sh", "cmd.exe.", "CMD.EXE ", "forfiles", "env", "wscript", "x.bat", "x.cmd", "x.ps1"):
             c = demo_config()
             c["adapters"]["build"]["render"]["argv"] = [sh, "-c", "echo hi"]
-            self.bad(c, "shell")
+            self.bad(c, "")
 
     def test_abs_path_in_check_refused(self):
         c = demo_config()

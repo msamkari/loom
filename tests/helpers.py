@@ -74,6 +74,8 @@ class Base(unittest.TestCase):
         os.makedirs(self.root)
         self._env = dict(os.environ)
         os.environ["LOOM_HOME"] = self.home
+        os.environ["LOOM_TEST"] = "1"
+        self.auto_trust = True
         for k in ("LOOM_NOW", "LOOM_NO_PUBLISH", "LOOM_LOCK_STALE", "LOOM_LOCK_TIMEOUT"):
             os.environ.pop(k, None)
         self._cwd = os.getcwd()
@@ -103,6 +105,16 @@ class Base(unittest.TestCase):
         return json.loads(self.r(rel))
 
     # --- project
+    def allow_env(self, *names):
+        """The user's own allow-list file ($LOOM_HOME/env_allow.json)."""
+        os.makedirs(self.home, exist_ok=True)
+        with open(os.path.join(self.home, "env_allow.json"), "w") as f:
+            json.dump({"allow": list(names)}, f)
+
+    def trust(self):
+        """What the user does after reviewing the printed commands: `trust --yes`."""
+        return self.run_loom("trust", "--yes")
+
     def make_project(self, cfg=None, tools=True):
         self.w("loom.config.json", json.dumps(cfg or demo_config(), indent=2))
         self.w("Loom/ledger.json", json.dumps({"schema": 1, "items": []}))
@@ -110,9 +122,13 @@ class Base(unittest.TestCase):
             self.w("tools/lint.py", LINT)
             self.w("tools/build.py", BUILD)
             self.w("tools/post.py", POST)
+        if self.auto_trust:
+            self.trust()
 
     def set_config(self, cfg):
         self.w("loom.config.json", json.dumps(cfg, indent=2))
+        if self.auto_trust:
+            self.trust()
 
     def ledger(self):
         return self.jr("Loom/ledger.json")

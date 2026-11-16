@@ -85,11 +85,12 @@ class SafetyTests(AdapterBase):
     def test_cwd_is_project_root(self):
         self.adapter("import os; print(os.getcwd())")
         o = self.run_ok("build", "ep1", "x", "--root", self.root, cwd=self.tmp)
-        self.assertEqual(os.path.realpath(o.splitlines()[0]), os.path.realpath(self.root))
+        self.assertEqual(os.path.realpath(o.splitlines()[0].replace("  > ", "")), os.path.realpath(self.root))
 
     def test_env_allowlist_filters_secrets(self):
         os.environ["LOOM_TEST_SECRET"] = "supersecretvalue123"
         os.environ["LOOM_TEST_ALLOWED"] = "allowedvalue456"
+        self.allow_env("LOOM_TEST_ALLOWED")
         self.adapter("import os; print(os.environ.get('LOOM_TEST_SECRET','absent'),"
                      " os.environ.get('LOOM_TEST_ALLOWED','absent'))", env=["LOOM_TEST_ALLOWED"])
         o = self.run_ok("build", "ep1", "x")
@@ -101,6 +102,7 @@ class SafetyTests(AdapterBase):
 
     def test_never_prints_env_values_in_ledger(self):
         os.environ["LOOM_TEST_ALLOWED"] = "allowedvalue456"
+        self.allow_env("LOOM_TEST_ALLOWED")
         self.adapter("import os; print(os.environ['LOOM_TEST_ALLOWED'])", env=["LOOM_TEST_ALLOWED"])
         self.run_ok("build", "ep1", "x")
         self.assertNotIn("allowedvalue456", self.r("Loom/ledger.json"))
@@ -204,7 +206,8 @@ class PublishTests(AdapterBase):
     def test_publish_approval_cannot_schedule(self):
         self.ready()
         self.approve("publish")
-        self.assertEqual(self.run_loom("schedule", "ep1", "--channel", "chan1", "--when", "now")[0], 2)
+        self.assertEqual(self.run_loom("schedule", "ep1", "--channel", "chan1", "--when", "now")[0], 1)
+        self.assertEqual(self.run_loom("schedule", "ep1", "--channel", "chan1", "--when", "2099-01-01T00:00:00Z")[0], 2)
 
     def test_expired_approval(self):
         self.ready()
@@ -238,14 +241,14 @@ class PublishTests(AdapterBase):
         self.assertIsNone(self.ledger()["items"][0]["approvals"][0]["used"])
         self.assertEqual(self.log(), "")
 
-    def test_approval_consumed_even_if_adapter_fails(self):
+    def test_approval_not_consumed_if_adapter_fails(self):
         c = demo_config()
         c["adapters"]["publish"]["post"]["argv"] = ["{python}", "-c", "import sys; sys.exit(9)"]
         self.set_config(c)
         self.ready()
         self.approve("publish")
         self.assertEqual(self.run_loom("publish", "ep1", "--channel", "chan1")[0], 2)
-        self.assertTrue(self.ledger()["items"][0]["approvals"][0]["used"])
+        self.assertFalse(self.ledger()["items"][0]["approvals"][0]["used"])  # a failing command does not burn it
 
     def test_shadow_mode_refuses_stage_publish_schedule(self):
         c = demo_config(shadow_mode=True)
