@@ -243,6 +243,7 @@ def atomic_write(path, data, bak=False):
         except OSError:
             pass
         if bak and os.path.isfile(path):
+            need(not is_link(path + ".bak"), "refusing symlink/junction: backup file")
             shutil.copyfile(path, path + ".bak")
         for i in range(12):
             try:
@@ -442,7 +443,7 @@ def validate_config(cfg):
     keys(cfg, ["schema", "pack", "project_kind", "shadow_mode", "excluded_folders", "identity",
                "channels", "formats", "adapters", "commands", "approval_ttl_hours"],
          ["schema", "formats"], "config")
-    need(cfg["schema"] == SCHEMA, "config: unsupported schema %r" % (cfg["schema"],))
+    need(type(cfg["schema"]) is int and cfg["schema"] == SCHEMA, "config: unsupported schema %r" % (cfg["schema"],))
     if "pack" in cfg:
         is_str(cfg["pack"], "config.pack", 40, re.compile(r"^[A-Za-z0-9_-]+$"))
     if "project_kind" in cfg:
@@ -511,7 +512,7 @@ def load_config(root):
 # ---------------------------------------------------------------- ledger
 def validate_ledger(led, extra=()):
     keys(led, ["schema", "items"], ["schema", "items"], "ledger")
-    need(led["schema"] == SCHEMA, "ledger: unsupported schema %r" % (led["schema"],))
+    need(type(led["schema"]) is int and led["schema"] == SCHEMA, "ledger: unsupported schema %r" % (led["schema"],))
     items = is_list(led["items"], "ledger.items", 5000)
     seen = set()
     for it in items:
@@ -538,10 +539,10 @@ def validate_ledger(led, extra=()):
                 if k in g:
                     need(isinstance(g[k], str) and len(g[k]) <= 1000 and not CTRL_RE.search(g[k]),
                          w + " gate.%s: bad" % k)
-        need(len(is_list(it["artifacts"], w + ".artifacts", 200)) == len(set(it["artifacts"])),
-             w + ".artifacts: duplicates")
+        is_list(it["artifacts"], w + ".artifacts", 200)
         for a in it["artifacts"]:
             safe_rel(a, extra, w + ".artifacts")
+        need(len(set(it["artifacts"])) == len(it["artifacts"]), w + ".artifacts: duplicates")
         for a in is_list(it["approvals"], w + ".approvals", 100):
             keys(a, ["what", "channel", "when", "date", "note", "used"],
                  ["what", "channel", "when", "date"], w + " approval")
@@ -753,6 +754,10 @@ def run_command(argv, root, spec):
     return proc.returncode, sanitise(bytes(buf), counter[0], cap, redact), timed_out
 
 
+def oneline(s, n=1000):
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(s))[:n]
+
+
 def first_line(text, n=200):
     for ln in text.splitlines():
         if ln.strip():
@@ -835,28 +840,33 @@ def run_checks(root, cfg, item, stage):
            "pack": cfg.get("pack")}
     results, cmds = [], []
     for chk in stage.get("checks", []):
-        t = chk["type"]
-        if t == "facts":
-            results.append(check_facts(root, item_path(chk["file"], item["id"]), extra))
-        elif t == "checklist":
-            results.append(check_checklist(root, item_path(chk["file"], item["id"]), extra))
-        elif t == "files":
-            results.append(check_files(root, chk["paths"], item["id"], extra))
-        else:
-            cmds.append(" ".join(chk["argv"])[:200])
-            argv = expand_argv(chk["argv"], ctx, cfg.get("commands", {}), root)
-            rc, text, to = run_command(argv, root, chk)
-            if to:
-                results.append((False, "command timed out after %ss" % chk.get("timeout", 60)))
-            elif rc is None:
-                results.append((False, text))
-            elif rc in chk.get("pass_codes", [0]):
-                results.append((True, "command ok (exit %d)" % rc))
-            else:
-                results.append((False, "command exit %d: %s" % (rc, first_line(text, 150))))
-    ok = all(r[0] for r in results)
+        try:
+            results.append(run_one_check(root, cfg, item, chk, ctx, extra, cmds))
+        except LoomError as e:
+            results.append((False, "check error: %s" % e))
+    ok = all(r[0] for r in results) and bool(results or not stage.get("checks"))
     detail = "; ".join(r[1] for r in results) or "no checks configured"
-    return ok, detail[:1000], "; ".join(cmds)[:500]
+    return ok, oneline(detail), oneline("; ".join(cmds), 500)
+
+
+def run_one_check(root, cfg, item, chk, ctx, extra, cmds):
+    t = chk["type"]
+    if t == "facts":
+        return check_facts(root, item_path(chk["file"], item["id"]), extra)
+    if t == "checklist":
+        return check_checklist(root, item_path(chk["file"], item["id"]), extra)
+    if t == "files":
+        return check_files(root, chk["paths"], item["id"], extra)
+    cmds.append(" ".join(chk["argv"])[:200])
+    argv = expand_argv(chk["argv"], ctx, cfg.get("commands", {}), root)
+    rc, text, to = run_command(argv, root, chk)
+    if to:
+        return False, "command timed out after %ss" % chk.get("timeout", 60)
+    if rc is None:
+        return False, text
+    if rc in chk.get("pass_codes", [0]):
+        return True, "command ok (exit %d)" % rc
+    return False, "command exit %d: %s" % (rc, first_line(text, 150))
 
 
 # ---------------------------------------------------------------- templates / presets
@@ -984,7 +994,8 @@ def entry(root, rel, data, action, before=None, snap=None):
 
 def validate_manifest(m):
     keys(m, ["schema", "mode", "date", "snapshot_dir", "files"], ["schema", "mode", "date", "files"], "manifest")
-    need(m["schema"] == SCHEMA and m["mode"] in ("init", "adopt"), "manifest: bad schema or mode")
+    need(type(m["schema"]) is int and m["schema"] == SCHEMA and m["mode"] in ("init", "adopt"),
+         "manifest: bad schema or mode")
     for f in is_list(m["files"], "manifest.files", 200):
         keys(f, ["path", "action", "sha256_before", "sha256_after", "snapshot"],
              ["path", "action", "sha256_after"], "manifest file")
@@ -1010,20 +1021,31 @@ def write_new(root, rel, data, extra=()):
 
 
 def install(root, cfg, mode, snap_files=(), claude_block=False):
-    """Create the loom files (never overwriting). Caller holds the lock."""
-    entries, created = [], []
-    skipped = []
-    for rel, data in plan_files(cfg):
-        if write_new(root, rel, data):
-            entries.append(entry(root, rel, data, "created"))
-            created.append(rel)
-        else:
-            skipped.append(rel)
-    snap_dir = None
+    """Create the loom files (never overwriting). Caller holds the lock.
+    Everything that can fail is checked or snapshotted before the first loom file is written,
+    and the manifest is written even if a later step fails, so rollback can always undo."""
+    plan = plan_files(cfg)
+    for rel, _ in plan:
+        abs_in(root, rel)
+    abs_in(root, MANIFEST_REL)
+    snap_dir, by = None, {}
     if mode == "adopt":
         snap_dir, snaps = make_snapshot(root, snap_files)
         by = dict(snaps)
-        if claude_block and "CLAUDE.md" in by:
+    entries, created, skipped = [], [], []
+
+    def write_manifest():
+        m = {"schema": SCHEMA, "mode": mode, "date": now_utc(), "snapshot_dir": snap_dir, "files": entries}
+        validate_manifest(m)
+        atomic_write(abs_in(root, MANIFEST_REL), dumps(m))
+    try:
+        for rel, data in plan:
+            if write_new(root, rel, data):
+                entries.append(entry(root, rel, data, "created"))
+                created.append(rel)
+            else:
+                skipped.append(rel)
+        if mode == "adopt" and claude_block and "CLAUDE.md" in by:
             p = abs_in(root, "CLAUDE.md")
             before = sha256_file(p)
             block = ("\n<!-- loom:begin -->\nThis project is tracked by loom in shadow mode "
@@ -1033,9 +1055,10 @@ def install(root, cfg, mode, snap_files=(), claude_block=False):
                 f.write(block.encode("utf-8"))
             entries.append({"path": "CLAUDE.md", "action": "modified", "sha256_before": before,
                             "sha256_after": sha256_file(p), "snapshot": by["CLAUDE.md"]})
-    m = {"schema": SCHEMA, "mode": mode, "date": now_utc(), "snapshot_dir": snap_dir, "files": entries}
-    validate_manifest(m)
-    atomic_write(abs_in(root, MANIFEST_REL), dumps(m))
+    finally:
+        if entries:
+            write_manifest()
+    write_manifest()
     return created, skipped, snap_dir
 
 
@@ -1097,7 +1120,7 @@ def load_profile():
 
 def validate_profile(d):
     keys(d, ["schema", "identity", "pack", "default_formats", "channels", "created"], ["schema"], "profile")
-    need(d["schema"] == SCHEMA, "profile: unsupported schema")
+    need(type(d["schema"]) is int and d["schema"] == SCHEMA, "profile: unsupported schema")
     if "identity" in d:
         keys(d["identity"], ["name", "notes"], [], "profile.identity")
         for k, v in d["identity"].items():
@@ -1163,6 +1186,8 @@ def cmd_init(args):
     exists = os.path.lexists(os.path.join(root, CONFIG_REL))
     need(not exists, "%s already exists: init never overwrites (use adopt/rollback or edit by hand)" % CONFIG_REL)
     out("loom init plan (%s):" % ("will write" if args.yes else "dry run, nothing written"))
+    out("proposed %s:" % CONFIG_REL)
+    out(json.dumps(cfg, ensure_ascii=False, indent=2))
     for rel, _ in plan:
         st = "exists, kept" if os.path.lexists(os.path.join(root, *rel.split("/"))) else "create"
         out("  %-8s %s" % (st, rel))
@@ -1206,7 +1231,9 @@ def cmd_adopt(args):
         "will write" if args.yes else "dry run, nothing written", ", ".join(cfg["formats"])))
     out("files added (additive only):")
     for rel, _ in plan:
-        out("  create   %s" % rel)
+        out("  %-8s %s" % ("kept" if os.path.lexists(os.path.join(root, *rel.split("/"))) else "create", rel))
+    out("proposed %s:" % CONFIG_REL)
+    out(json.dumps(cfg, ensure_ascii=False, indent=2))
     out("  create   %s" % MANIFEST_REL)
     out("pre-adopt snapshot (config/state files only) -> Jobs/_Archive/loom_pre_adopt_%s*/" % today())
     for s in snaps:
@@ -1228,11 +1255,7 @@ def cmd_adopt(args):
     return 0
 
 
-def cmd_rollback(args):
-    root = root_of(args)
-    mp = abs_in(root, MANIFEST_REL)
-    need(os.path.isfile(mp), "no %s: nothing to roll back" % MANIFEST_REL)
-    m = validate_manifest(read_json(mp, MAX_LEDGER, "manifest"))
+def rollback_plan(root, m):
     plan, kept = [], 0
     for f in m["files"]:
         p = abs_in(root, f["path"])
@@ -1260,6 +1283,15 @@ def cmd_rollback(args):
             else:
                 plan.append((f, "KEEP (edited since loom wrote it)", None))
                 kept += 1
+    return plan, kept
+
+
+def cmd_rollback(args):
+    root = root_of(args)
+    mp = abs_in(root, MANIFEST_REL)
+    need(os.path.isfile(mp), "no %s: nothing to roll back" % MANIFEST_REL)
+    m = validate_manifest(read_json(mp, MAX_LEDGER, "manifest"))
+    plan, kept = rollback_plan(root, m)
     out("loom rollback plan (%s):" % ("executing" if args.yes else "dry run, nothing changed"))
     for f, act, _ in plan:
         out("  %-38s %s" % (act, f["path"]))
@@ -1267,6 +1299,7 @@ def cmd_rollback(args):
         out("re-run with --yes to execute")
         return 0
     with Lock(root):
+        plan, kept = rollback_plan(root, m)  # re-hash under the lock, right before acting
         for f, act, sp in plan:
             p = abs_in(root, f["path"])
             if act == "remove":
@@ -1274,15 +1307,17 @@ def cmd_rollback(args):
             elif act == "restore from snapshot":
                 atomic_write(p, read_capped(sp, MAX_SNAPSHOT, "snapshot"))
         if kept == 0:
-            for rel in (MANIFEST_REL, LEDGER_REL + ".bak"):
-                q = abs_in(root, rel)
-                if os.path.isfile(q):
-                    os.unlink(q)
+            q = abs_in(root, MANIFEST_REL)
+            if os.path.isfile(q):
+                os.unlink(q)
             for rel in (TEMPLATES_REL, ITEMS_REL, "Loom"):
                 try:
                     os.rmdir(abs_in(root, rel))
                 except OSError:
                     pass
+    if os.path.isfile(os.path.join(root, *LEDGER_REL.split("/"))) or os.path.isfile(
+            os.path.join(root, *(LEDGER_REL + ".bak").split("/"))):
+        out("left in place (not in the manifest): Loom/ledger.json.bak or ledger data")
     out("done; %d file(s) left untouched because they were edited" % kept if kept else
         "done; everything loom added was removed (snapshot folder kept as archive)")
     return 0
@@ -1494,7 +1529,7 @@ def cmd_advance(args):
         else:
             it["stage"] = names[idx + 1]
             msg = "%s moved %s -> %s" % (it["id"], st["name"], it["stage"])
-        capped_append(it["events"], {"date": now_utc(), "action": "advance", "result": "ok", "detail": msg[:300]})
+        capped_append(it["events"], {"date": now_utc(), "action": "advance", "result": "ok", "detail": oneline(msg, 300)})
         save_ledger(root, led, extra)
     out(msg)
     return 0
@@ -1572,7 +1607,7 @@ def run_adapter(kind, args):
         it = find_item(led, args.item)
         res = "timeout" if to else ("ok" if ok else "failed rc=%s" % rc)
         capped_append(it["events"], {"date": now_utc(), "action": kind, "adapter": name, "result": res[:40],
-                                     "detail": first_line(text, 300)})
+                                     "detail": oneline(first_line(text, 300), 300)})
         for rel in made:
             if rel not in it["artifacts"] and len(it["artifacts"]) < 200:
                 it["artifacts"].append(rel)
@@ -1683,6 +1718,9 @@ def main(argv=None):
         return 1
     except OSError as e:
         sys.stderr.write("error: %s (%s)\n" % (e.__class__.__name__, e.strerror or ""))
+        return 1
+    except Exception as e:  # last resort: fail loudly with one line, never a traceback
+        sys.stderr.write("error: internal %s: %s\n" % (e.__class__.__name__, str(e)[:200]))
         return 1
 
 

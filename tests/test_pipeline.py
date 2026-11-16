@@ -167,9 +167,11 @@ class GateTests(Base):
             self.w("Loom/items/ep1/facts.json", txt)
             self.assertEqual(self.run_loom("gate", "ep1", "research")[0], 2, txt)
 
-    def test_facts_corrupt_json_is_error(self):
+    def test_facts_corrupt_json_is_recorded_failure(self):
         self.w("Loom/items/ep1/facts.json", "{nope")
-        self.assertEqual(self.run_loom("gate", "ep1", "research")[0], 1)
+        rc, o, e = self.run_loom("gate", "ep1", "research")
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.ledger()["items"][0]["gates"][-1]["result"], "fail")
 
     def test_checklist(self):
         self.w("Loom/items/ep1/pre_voice.md", "- [x] a\n- [ ] b\n")

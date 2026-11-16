@@ -35,7 +35,7 @@
   "adapters": {
     "build": {
       "voice_dry": {
-        "argv": ["{cmd:lahja_voice}", "dry", "--", "{itempath:script.md}"],
+        "argv": ["{cmd:lahja_voice}", "dry", "{itempath:script.md}", "--voice-id", "demo-voice"],
         "timeout": 120,
         "env": []
       }
