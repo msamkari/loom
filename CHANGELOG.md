@@ -3,6 +3,7 @@
 This project follows [Semantic Versioning](https://semver.org/).
 
 ## [0.1.1] (2026-11-16)
+- Plugin icon added (square 1024 px PNG, generated with Gemini and chosen by the author).
 Fix batch from the round-2 adversarial report. Behaviour changes on purpose.
 ### Changed (trust model)
 - Trust pin: `gate`, `build`, `stage`, `publish`, `schedule` run a config command only if the SHA-256 of all configured commands (argv, env names, timeouts, pass codes, named commands, channels, absolute root, resolved program paths) is recorded in `$LOOM_HOME/trust.json`. New subcommand `trust` (not pre-approved; prints every command; `--yes` writes the pin). `status`/`next`/`gate` accept no root, never write outside `Loom/`; `gate` discards its result when the config or the ledger's approvals changed while it ran. A `LOOM_HOME` inside the project is refused.
