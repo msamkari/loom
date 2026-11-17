@@ -305,7 +305,8 @@ def check_nolink(path, what):
     except OSError:
         return
     need(not (stat.S_ISREG(st.st_mode) and st.st_nlink > 1),
-         "%s has several hard links: refused (copy the file instead of linking it)" % what)
+         "%s has several hard links: refused (copy the file instead of linking it; a crash while loom "
+         "wrote it can also leave a stray .loom-*.tmp link next to it: delete that .tmp file)" % what)
 
 
 def read_capped(path, cap, what):
@@ -418,10 +419,14 @@ def create_exclusive(path, data):
             f.write(data)
         return True
     finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        for attempt in range(5):  # a leftover link would make the file look hard-linked
+            try:
+                os.unlink(tmp)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                time.sleep(0.02 * (attempt + 1))
 
 
 def sha256_file(path):
@@ -1362,20 +1367,35 @@ def analyse_python(root, args, files, notes, problems):
             key, val = pin_path(root, tok)
             files[key] = val
             notes.append("script %s: content pinned" % key)
+            probe = tok if os.path.isabs(tok) else os.path.join(root, *tok.split("/"))
+            if os.path.isdir(probe):  # `python folder` runs folder/__main__.py
+                k2, v2 = pin_path(root, tok.rstrip("/") + "/__main__.py")
+                files[k2] = v2
+                notes.append("script folder: %s pinned" % k2)
         return i + 1
     return i
 
 
-def pin_files_in(root, args, files):
-    """Any other argument that names an existing file inside the project is pinned too."""
+def pin_files_in(root, args, files, problems):
+    """Any other whole-token argument that names an existing file is pinned too: inside the
+    project (checked with the usual path rules) or by absolute path. A path form the rules
+    refuse (./x, backslashes, ..) that still names a real file is a PROBLEM, never skipped.
+    Attached forms such as --require=x.js are not covered (documented limit)."""
     for t in args:
         if not t or t.startswith("-") or PH_RE.match(t) or "{" in t:
             continue
+        if os.path.isabs(t):
+            if os.path.isfile(t):
+                key, val = pin_path(root, t)
+                files[key] = val
+            continue
         try:
-            if os.path.isabs(t):
-                continue
             p = abs_in(root, t)
         except LoomError:
+            probe = os.path.join(root, t)
+            if os.path.isfile(probe):
+                problems.append("the argument %s names a file but its path form is refused (write it as a "
+                                "plain relative path with /); it cannot be pinned" % clean(t, 80))
             continue
         if os.path.isfile(p):
             files[t] = sha256_file(p)
@@ -1408,7 +1428,7 @@ def pin_entries(root, cfg):
                     while args and re.match(r"^-\d+(\.\d+)?(-\d+)?\Z", args[0]):
                         args = args[1:]
                 used = analyse_python(root, args, e["files"], e["notes"], e["problems"])
-            pin_files_in(root, args[used:], e["files"])
+            pin_files_in(root, args[used:], e["files"], e["problems"])
         except LoomError as ex:
             e["problems"].append("a file named in the command is refused: %s" % ex)
         res.append(e)
@@ -2950,8 +2970,10 @@ def run_adapter(kind, args):
             try:
                 require_trust(root, cfg, kind)
                 out("commands pinned with `trust`: yes")
-            except Refused:
-                out("commands pinned with `trust`: NO (run `trust` and review, then `trust --yes`)")
+            except Refused as ex:
+                out("commands pinned with `trust`: NO (review them with `trust`; what changed is listed below)")
+                for ln in list(ex.details)[:30]:
+                    out("  - %s" % ln, 700)
             if kind in ("publish", "schedule"):
                 out("approval on record for item+channel+time: %s" % ("yes" if ap is not None else "NO"))
             return 0
@@ -2991,7 +3013,7 @@ def run_adapter(kind, args):
             for a in it["approvals"]:
                 if a.get("sig") == sig and a.get("claimed") and not a.get("used"):
                     a["claimed"] = None
-                    if ok:
+                    if ok or to:  # a timed-out adapter may already have acted: the approval is burned
                         a["used"] = now_utc()
                     break
         for rel in made:
@@ -2999,7 +3021,11 @@ def run_adapter(kind, args):
                 it["artifacts"].append(rel)
         save_ledger(root, led, extra)
     if not ok and sig is not None:
-        release_spent(sig)  # the action did not happen: the approval can be used again
+        if to:
+            out("the adapter timed out and may already have acted: the approval stays spent "
+                "(check the target, then approve again to retry)")
+        else:
+            release_spent(sig)  # it failed or could not start: the approval can be used again
     out_block(text.rstrip())
     out("%s adapter %s: %s" % (kind, name, res))
     return 0 if ok else 2

@@ -681,6 +681,90 @@ class NextAtPublishTests(AdapterBase):
         self.assertEqual(self.nxt()["next"], "advance")
 
 
+class PinGapTests(Base):
+    """No silent no-pin path: folders, absolute paths and refused path forms."""
+
+    def setUp(self):
+        super().setUp()
+        self.auto_trust = False
+
+    def entry(self, argv):
+        cfg = cfg_with(argv)
+        e = loom.pin_entries(self.root, cfg)
+        return [x for x in e if x["label"].startswith("gate demo/script")][0]
+
+    def test_python_folder_script_pins_its_main_file(self):
+        self.w("tools/__main__.py", CHECK)
+        e = self.entry(["{python}", "tools"])
+        self.assertIsNotNone(e["files"].get("tools/__main__.py"))
+        self.assertEqual(e["problems"], [])
+        self.make_project(cfg_with(["{python}", "tools"]))
+        self.add_item("ep1")
+        self.w("tools/__main__.py", CHECK)
+        self.run_ok("trust", "--yes")
+        self.run_ok("gate", "ep1", "script")
+        self.w("tools/__main__.py", CHECK + "# changed\n")
+        self.assertEqual(self.run_loom("gate", "ep1", "script")[0], 2)
+
+    def test_other_programs_absolute_file_arguments_are_hashed(self):
+        outside = os.path.join(self.tmp, "x.js")
+        with open(outside, "w") as f:
+            f.write("1")
+        e = self.entry(["somelint", outside])
+        hit = [k for k, v in e["files"].items() if k.endswith("x.js")]
+        self.assertTrue(hit and e["files"][hit[0]])
+
+    def test_refused_path_form_that_names_a_real_file_is_a_problem(self):
+        self.w("tools/x.js", "1")
+        e = self.entry(["somelint", "./tools/x.js"])
+        self.assertTrue([p for p in e["problems"] if "cannot be pinned" in p], e["problems"])
+        e = self.entry(["somelint", "tools/../tools/x.js"])
+        self.assertTrue(e["problems"])
+        if os.name == "nt":
+            e = self.entry(["somelint", "tools\\x.js"])
+            self.assertTrue(e["problems"])
+        self.make_project(cfg_with(["somelint", "./tools/x.js"]))
+        rc, o, e2 = self.run_loom("trust", "--yes")
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "trust.json")))
+
+    def test_plain_relative_file_for_another_program_is_pinned(self):
+        self.w("tools/x.js", "1")
+        e = self.entry(["somelint", "tools/x.js", "plainword"])
+        self.assertIsNotNone(e["files"]["tools/x.js"])
+        self.assertEqual(e["problems"], [])
+
+
+class DryRunTextTests(AdapterBase):
+    def test_dry_run_on_a_changed_pin_lists_changes_without_the_flag(self):
+        self.ready()
+        self.w("tools/post.py", "print('changed')\n")
+        o = self.run_ok("publish", "ep1", "--channel", "chan1", "--dry-run")
+        self.assertIn("pinned with `trust`: NO", o)
+        self.assertIn("tools/post.py", o)
+        self.assertNotIn("--yes", o)
+
+
+class TimeoutKeepsApprovalSpentTests(AdapterBase):
+    def test_timed_out_publish_stays_spent_and_cannot_double_post(self):
+        c = demo_config()
+        c["adapters"]["publish"]["post"] = {
+            "argv": ["{python}", "-c", "import time;open('posted.log','a').write('x');time.sleep(30)"],
+            "timeout": 1}
+        self.set_config(c)
+        self.ready()
+        self.approve("publish")
+        sig = self.ledger()["items"][0]["approvals"][0]["sig"]
+        rc, o, e = self.run_loom("publish", "ep1", "--channel", "chan1")
+        self.assertEqual(rc, 2)
+        self.assertIn("stays spent", o)
+        self.assertIn(sig, loom.spent_sigs())
+        self.assertTrue(self.ledger()["items"][0]["approvals"][0]["used"])
+        rc, o, e = self.run_loom("publish", "ep1", "--channel", "chan1")
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.log(), "x")
+
+
 class DocsAndLayoutTests(unittest.TestCase):
     def test_no_tracked_text_file_has_crlf(self):
         bad = []
