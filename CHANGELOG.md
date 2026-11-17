@@ -2,6 +2,29 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] (2026-11-17)
+Fix batch from the round-3 adversarial reports (trust models; operator misuse and durability). Behaviour changes on purpose; pins written by 0.1.1 are refused with a clear message and need one new `trust`.
+### Fixed
+- Trust pin content (L-H1): the pin now holds the SHA-256 of the script an interpreter runs, of every project file a `python -m module` could load (including the pinned absence of files that do not exist), and of any other argument naming an existing project file; editing one after `trust` makes `gate` refuse. Inline `-c` code is pinned verbatim. Interpreter options the pin cannot read are refused at `trust`.
+- Trust review (L-H2): `trust` prints each argv expanded (named commands included), as a JSON list, never truncated, plus the program path and hash and every pinned file; an argv over 4000 characters is refused with the reason.
+- Mismatch handling (B11): the pin record stores the absolute interpreter path and the SHA-256 of the program file; a refusal prints what changed line by line (PATH-resolved program, program content, script hash, argv, env names, settings) and never suggests `--yes`; it says that confirming without reading defeats the pin. A 0.1.1 string pin is refused as "older loom".
+- Structure (low): the whole config is in the pin, so removing or changing stages or checks changes it; `gate` also enforces the pin for a command-less stage once a pin exists for the folder.
+- Helpers (L-M1, B1): `icacls` and `taskkill` are started only by absolute path under `%SystemRoot%/System32` (never from the current folder or PATH); if missing, loom refuses before writing anything private.
+- Spent approvals (B6): the spent signature is written (fsync, bounded retries) BEFORE the adapter runs; if it cannot be written, `publish`/`schedule`/`advance` refuse and run nothing; a restored older ledger cannot publish twice; a failed adapter releases the reservation; entries are pruned by age (800 h), not by count; the 0.1.1 list format is still read.
+- Locks (B2, B3): the lock owner records the process start time (Windows creation time, Linux `/proc`), so a reused pid no longer keeps a stale lock alive; where it cannot be read, only a 24 h hard age frees a live pid. The message names the lock folder and the safe manual step instead of promising a takeover. A lock dated in the future ages out.
+- Serialised home writes (B16): `trust --yes`, spent records and the rollback manifest record are read-modify-written under a lock in `$LOOM_HOME` (12 parallel `trust --yes` keep 12 pins); `secret.key` is created exclusively so two first runs share one key.
+- Hard links: a ledger, config or backup file with more than one hard link is refused.
+- Sanitiser: also removes variation selectors, tag and private-use characters and invisible fillers (U+3164, U+115F, U+2800, U+034F, U+17B4 ...); Arabic tashkeel and real letters are kept.
+- `next` at the publish stage points to `approve` and `publish`/`schedule` instead of `advance`, which would close the item unpublished.
+- Docs (B18): README says which commands write (`add`, `attach`, `approve`, `advance` write immediately; the false "without --yes nothing is written" is gone), command examples use the plugin folder, quoting for paths with spaces and the PowerShell form are documented in README and skill, the "No icon yet" line is gone.
+- Repo hygiene (B20): `.gitattributes` (`* text=auto eol=lf`), CHANGELOG/LICENSE/CI/test files normalised to LF, tests check no tracked text file has CRLF and that `.claude-plugin/` holds only `plugin.json` and the square PNG icon.
+### Known limits
+- A pinned interpreter command can still do anything the user's account can. Modules a pinned script imports from the project (`import helper`) and code that `-c` imports are not pinned. A script can change between the pin check and its start.
+- B12: the program file content is part of the pin, so an interpreter or tool upgrade needs `trust` again; a writable PATH folder remains part of the trust boundary.
+- On Windows a process started through WMI, a scheduled-task API or a service outlives the run (no process tree contains it). Paths over about 258 characters are not supported.
+- Not fixed, on purpose: B5 upper-case hex in `secret.key` is rejected (deleting it is safe, accepting hand-restored keys is a convenience, not security); B7 no retry on reads of a transiently locked ledger (the message is honest); B9 no archive command for a ledger near 1 MB (needs a design, not a patch); B10 orphan `.loom-*.tmp` files are not swept; B13 a virtualenv `python` inside the project is not refused; B15 `--when` is compared as a string; B19 a few older tests still wait on child processes (the live-holder lock test no longer sleeps); the `LOOM_TEST=1`+`LOOM_NOW` pair set by hand still shifts approval expiry (it is a test hook, off unless both are set).
+- Not verified: POSIX/macOS runtime, Python 3.8 and 3.12 runtime, CI, the planted-`icacls` repro with the current-folder search enabled, the real Claude Code permission prompts, real Dropbox sync.
+
 ## [0.1.1] (2026-11-16)
 - Plugin icon added (square 1024 px PNG, generated with Gemini and chosen by the author).
 Fix batch from the round-2 adversarial report. Behaviour changes on purpose.

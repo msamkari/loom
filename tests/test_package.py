@@ -35,7 +35,7 @@ class PackageTests(unittest.TestCase):
     def test_manifest(self):
         m = json.loads(read(".claude-plugin/plugin.json"))
         self.assertEqual(m["name"], "loom")
-        self.assertEqual(m["version"], "0.1.1")
+        self.assertEqual(m["version"], "0.1.2")
         self.assertEqual(m["license"], "MIT")
         self.assertNotIn("icon", m)
 
@@ -85,7 +85,7 @@ class PackageTests(unittest.TestCase):
     def test_python38_grammar_for_script_and_tests(self):
         import ast
         for rel in ("scripts/loom.py", "tests/helpers.py", "tests/test_trust.py", "tests/test_exec.py",
-                    "tests/test_output.py", "tests/test_recovery.py"):
+                    "tests/test_output.py", "tests/test_recovery.py", "tests/test_round3.py"):
             ast.parse(read(rel), feature_version=(3, 8))
 
     def test_skills_document_trust_and_keep_allowed_tools(self):

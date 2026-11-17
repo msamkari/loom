@@ -401,7 +401,9 @@ class LockTests(Base):
         p = subprocess.Popen([sys.executable, "-c", code, SCRIPT, self.root], stdout=subprocess.PIPE, env=env)
         try:
             self.assertEqual(p.stdout.readline().strip(), b"ready")
-            time.sleep(1.3)  # older than the stale limit, but the holder is alive
+            lock_dir = os.path.join(self.root, "Loom", loom.LOCK_NAME)
+            old = time.time() - 3600  # older than the stale limit, but the holder is alive
+            os.utime(lock_dir, (old, old))
             rc, o, e = self.run_sub("add", "z1", "--format", "demo", "--root", self.root,
                                     env={"LOOM_LOCK_STALE": "0.2", "LOOM_LOCK_TIMEOUT": "0.5"})
             self.assertEqual(rc, 1, e)

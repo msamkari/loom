@@ -415,7 +415,7 @@ class CliTests(Base):
     def test_version_and_help(self):
         rc, o, e = self.run_sub("--version")
         self.assertEqual(rc, 0)
-        self.assertIn("0.1.1", o)
+        self.assertIn("0.1.2", o)
 
     def test_no_subcommand_is_error(self):
         self.assertEqual(self.run_sub()[0], 1)

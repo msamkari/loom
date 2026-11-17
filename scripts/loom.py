@@ -29,8 +29,11 @@ import time
 import unicodedata
 import uuid
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SCHEMA = 1
+PIN_VERSION = 2
+ARGV_PRINT_MAX = 4000
+SPENT_KEEP_SECONDS = 800 * 3600  # longer than the longest approval lifetime (720 h)
 
 CONFIG_REL = "loom.config.json"
 LEDGER_REL = "Loom/ledger.json"
@@ -91,7 +94,8 @@ class LoomError(Exception):
 
 
 class Refused(LoomError):
-    pass
+    """A rule said no. `details` are extra lines printed one by one after the message."""
+    details = ()
 
 
 def need(cond, msg):
@@ -100,18 +104,38 @@ def need(cond, msg):
 
 
 # ---------------------------------------------------------------- output
+DROP_CATEGORIES = ("Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn")
+# invisible "letters" and marks that the category test alone does not catch: Hangul fillers,
+# braille blank, grapheme joiner, Khmer inherent vowels, Mongolian variation selectors,
+# variation selectors, tag characters, private-use planes. Arabic combining marks (tashkeel,
+# category Mn) and every real letter are NOT in this list.
+DROP_POINTS = frozenset([0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0])
+DROP_RANGES = ((0x180B, 0x180F), (0xFE00, 0xFE0F), (0xE0000, 0xE007F), (0xE0100, 0xE01EF),
+               (0xE000, 0xF8FF), (0xF0000, 0x10FFFF))
+
+
+def is_invisible(ch):
+    o = ord(ch)
+    if o in DROP_POINTS:
+        return True
+    for lo, hi in DROP_RANGES:
+        if lo <= o <= hi:
+            return True
+    return unicodedata.category(ch) in DROP_CATEGORIES
+
+
 def clean(s, cap=300):
     """The one sanitiser for everything loom prints. Removes ANSI/CSI/OSC sequences, C0/C1
-    controls, bidi controls, zero-width and tag characters, BOM, U+2028/2029 and lone
-    surrogates; newlines and tabs become a visible separator; the length is capped."""
+    controls, bidi controls (category Cf), zero-width, variation-selector, tag and private-use
+    characters, invisible fillers, BOM, U+2028/2029 and lone surrogates; newlines and tabs become
+    a visible separator; the length is capped. Combining marks of real scripts are kept."""
     if not isinstance(s, str):
         s = str(s)
     s = ANSI_RE.sub("", s)
     s = NEWLINE_RE.sub(SEP, s)
     keep = []
     for ch in s:
-        cat = unicodedata.category(ch)
-        if cat in ("Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"):
+        if is_invisible(ch):
             continue
         keep.append(ch)
     s = "".join(keep)
@@ -273,6 +297,17 @@ def ensure_dir(root, rel):
 
 
 # ---------------------------------------------------------------- io
+def check_nolink(path, what):
+    """Refuse a file that has more than one hard link: another name may point at data outside
+    the project (symlink and junction checks do not see hard links)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    need(not (stat.S_ISREG(st.st_mode) and st.st_nlink > 1),
+         "%s has several hard links: refused (copy the file instead of linking it)" % what)
+
+
 def read_capped(path, cap, what):
     try:
         size = os.stat(path).st_size
@@ -320,6 +355,7 @@ def dumps(obj):
 def atomic_write(path, data, bak=False):
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
+    check_nolink(path, os.path.basename(path))
     fd, tmp = tempfile.mkstemp(prefix=".loom-", suffix=".tmp", dir=d)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -332,6 +368,7 @@ def atomic_write(path, data, bak=False):
             pass
         if bak and os.path.isfile(path):
             need(not is_link(path + ".bak"), "refusing symlink/junction: backup file")
+            check_nolink(path + ".bak", os.path.basename(path) + ".bak")
             shutil.copyfile(path, path + ".bak")
         check_lock_held()
         for i in range(12):
@@ -449,7 +486,42 @@ def pid_alive(pid):
     return True
 
 
+def proc_start(pid):
+    """A value that identifies WHEN this process was created (so a reused pid is told apart),
+    or None where it cannot be read. Windows: creation time; Linux: /proc start ticks. No
+    external program is started."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+            k32.GetProcessTimes.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            h = k32.OpenProcess(0x1000, False, pid)
+            if not h:
+                return None
+            try:
+                c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+                if not k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+                    return None
+                return "w%d" % ((c.dwHighDateTime << 32) | c.dwLowDateTime)
+            finally:
+                k32.CloseHandle(h)
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            raw = f.read(4000).decode("ascii", "replace")
+        rest = raw[raw.rindex(")") + 2:].split()
+        return "l%s" % rest[19]  # field 22 of the stat line (starttime)
+    except Exception:
+        return None
+
+
 HOLDING = []
+LOCK_MAX_AGE = 24 * 3600  # takeover after this age where the process start time cannot be compared
 
 
 class Lock(object):
@@ -487,14 +559,21 @@ class Lock(object):
             age = time.time() - os.stat(self.path).st_mtime
         except OSError:
             return False
-        if age <= limit:
+        if -300 <= age <= limit:  # a lock dated far in the future (clock moved back) ages out too
             return False
         o = self._owner() or {}
         pid = o.get("pid")
         if isinstance(pid, int):
             if o.get("host", "") != self.host:
-                return age > limit * 10
-            return not pid_alive(pid)
+                return abs(age) > limit * 10
+            if not pid_alive(pid):
+                return True
+            # the pid lives: is it the same process that took the lock, or a reused pid?
+            was, now = o.get("start"), proc_start(pid)
+            if isinstance(was, str) and now is not None:
+                return was != now
+            # the start time cannot be compared: only a hard upper age frees the lock
+            return abs(age) > env_float("LOOM_LOCK_MAX_AGE", LOCK_MAX_AGE)
         return True
 
     def _break(self, limit):
@@ -504,7 +583,7 @@ class Lock(object):
         except OSError:
             return
         try:
-            if time.time() - os.stat(dead).st_mtime <= limit:
+            if -300 <= time.time() - os.stat(dead).st_mtime <= limit:
                 try:
                     os.rename(dead, self.path)  # was fresh after all: put it back
                     return
@@ -532,15 +611,20 @@ class Lock(object):
                     self._break(limit)
                     continue
                 if time.time() > end:
-                    raise LoomError("another loom command holds %s (waited %ds); "
-                                    "if no loom command is running it becomes stale after %ds"
-                                    % (LOCK_NAME, int(timeout), int(limit)))
+                    raise LoomError("another loom command holds the lock %s (waited %ds). It is taken "
+                                    "over as stale only when it is older than %ds and its process is "
+                                    "gone (the process id AND its start time are compared); where the "
+                                    "start time cannot be read, only after %ds. If you are sure no "
+                                    "loom command is running, delete that lock folder by hand"
+                                    % (self.path, int(timeout), int(limit),
+                                       int(env_float("LOOM_LOCK_MAX_AGE", LOCK_MAX_AGE))))
                 time.sleep(0.03)
             except OSError as e:
                 raise LoomError("cannot create lock: %s" % e.__class__.__name__)
         try:
             with open(os.path.join(self.path, "owner"), "w") as f:
-                f.write(json.dumps({"token": self.token, "pid": os.getpid(), "host": self.host}))
+                f.write(json.dumps({"token": self.token, "pid": os.getpid(), "host": self.host,
+                                    "start": proc_start(os.getpid())}))
         except OSError:
             pass
         HOLDING.append(self)
@@ -759,6 +843,7 @@ def config_extra(cfg):
 def load_config(root):
     p = abs_in(root, CONFIG_REL)
     need(os.path.isfile(p), "no %s in %s; run init (or adopt) first" % (CONFIG_REL, "this folder"))
+    check_nolink(p, CONFIG_REL)
     return validate_config(read_json(p, MAX_CONFIG, CONFIG_REL))
 
 
@@ -828,6 +913,7 @@ def validate_ledger(led, extra=()):
 def load_ledger(root, extra=()):
     p = abs_in(root, LEDGER_REL)
     need(os.path.isfile(p), "no %s; run init first" % LEDGER_REL)
+    check_nolink(p, LEDGER_REL)
     try:
         return validate_ledger(read_json(p, MAX_LEDGER, "ledger"), extra)
     except LoomError as e:
@@ -908,9 +994,23 @@ def home_dir(root=None):
     return d
 
 
+def system_tool(name):
+    """Absolute path of a Windows system helper (icacls, taskkill), taken from the system
+    folder only, never from the current folder or PATH. None on other systems. Raises if the
+    helper is missing (loom then refuses to continue)."""
+    if os.name != "nt":
+        return None
+    base = os.environ.get("SystemRoot") or os.environ.get("windir") or os.environ.get("WINDIR")
+    need(base and os.path.isabs(base), "SystemRoot is not set; cannot find %s safely" % name)
+    p = os.path.join(base, "System32", name + ".exe")
+    need(os.path.isfile(p), "%s was not found in the Windows system folder: refusing to continue" % name)
+    return p
+
+
 def ensure_home():
     d = home_dir()
     need(not is_link(d), "loom home folder is a symlink/junction: refused")
+    system_tool("icacls")  # fail before anything private is written
     os.makedirs(d, exist_ok=True)
     try:
         os.chmod(d, 0o700)
@@ -920,19 +1020,26 @@ def ensure_home():
 
 
 def private_file(path):
-    """Best effort: owner-only file mode (POSIX) or owner-only ACL (Windows)."""
+    """Owner-only file mode (POSIX) or owner-only ACL (Windows, through the system icacls)."""
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
     if os.name == "nt":
+        tool = system_tool("icacls")
         user = os.environ.get("USERNAME")
         if user:
             try:
-                subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", user + ":(R,W,D)"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                subprocess.run([tool, path, "/inheritance:r", "/grant:r", user + ":(R,W,D)"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+                               cwd=os.path.dirname(tool))
             except Exception:
                 pass
+
+
+def home_lock():
+    """Serialises every read-modify-write of a file in the loom home folder."""
+    return Lock(ensure_home(), inside=False)
 
 
 def home_json(name, default):
@@ -940,7 +1047,7 @@ def home_json(name, default):
     if not os.path.isfile(p):
         return default
     need(not is_link(p), "%s is a symlink/junction: refused" % name)
-    d = read_json(p, MAX_SMALL * 8, name)
+    d = read_json(p, MAX_SMALL * 16, name)
     need(isinstance(d, dict), "%s: must be an object" % name)
     return d
 
@@ -949,7 +1056,9 @@ def write_home_json(name, obj):
     ensure_home()
     p = os.path.join(home_dir(), name)
     need(not is_link(p), "%s is a symlink/junction: refused" % name)
-    atomic_write(p, dumps(obj))
+    data = dumps(obj)
+    need(len(data) <= MAX_SMALL * 16, "%s would exceed %d bytes" % (name, MAX_SMALL * 16))
+    atomic_write(p, data)
     private_file(p)
 
 
@@ -957,20 +1066,19 @@ def get_secret(create=False):
     """The per-user secret used to sign approvals and manifests. Never printed, never in the
     project. Only approve, profile, init and adopt create it; publish and schedule never do."""
     p = os.path.join(home_dir(), "secret.key")
-    if os.path.isfile(p):
-        need(not is_link(p), "secret.key is a symlink/junction: refused")
-        raw = decode(read_capped(p, 200, "secret.key"), "secret.key").strip()
-        need(re.match(r"^[0-9a-f]{64}\Z", raw), "secret.key is damaged (delete it to start over; old approvals die)")
-        return bytes.fromhex(raw)
-    if not create:
-        return None
-    ensure_home()
-    key = os.urandom(32)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(key.hex().encode("ascii"))
-    private_file(p)
-    return key
+    for attempt in range(2):
+        if os.path.isfile(p):
+            need(not is_link(p), "secret.key is a symlink/junction: refused")
+            raw = decode(read_capped(p, 200, "secret.key"), "secret.key").strip()
+            need(re.match(r"^[0-9a-f]{64}\Z", raw), "secret.key is damaged (delete it to start over; old approvals die)")
+            return bytes.fromhex(raw)
+        if not create:
+            return None
+        ensure_home()
+        # exclusive create: of two first-time runs at once exactly one wins, the other reads its key
+        if create_exclusive(p, os.urandom(32).hex().encode("ascii")):
+            private_file(p)
+    raise LoomError("could not create secret.key")
 
 
 def root_key(root):
@@ -994,19 +1102,63 @@ def approval_valid(root, item_id, a):
     return mac is not None and hmac.compare_digest(mac, sig)
 
 
+def spent_load():
+    """{signature: time-of-use or None} from $LOOM_HOME/spent.json (accepts the 0.1.1 list)."""
+    d = home_json("spent.json", {"sigs": {}})
+    s = d.get("sigs", {})
+    res = {}
+    if isinstance(s, list):
+        for x in s:
+            if isinstance(x, str):
+                res[x] = None
+    elif isinstance(s, dict):
+        for k, v in s.items():
+            if isinstance(k, str):
+                res[k] = v if isinstance(v, str) and TS_RE.match(v) else None
+    return res
+
+
 def spent_sigs():
-    d = home_json("spent.json", {"sigs": []})
-    s = d.get("sigs", [])
-    return set(x for x in s if isinstance(x, str)) if isinstance(s, list) else set()
+    return set(spent_load())
 
 
-def record_spent(sig):
+def spent_write(cur):
+    now = now_utc()
+    keep = {}
+    for k, v in cur.items():
+        if v is None:
+            keep[k] = now  # legacy entries start their retention now
+            continue
+        if (parse_ts(now) - parse_ts(v)).total_seconds() <= SPENT_KEEP_SECONDS:
+            keep[k] = v
+    write_home_json("spent.json", {"schema": 2, "sigs": keep})
+
+
+def reserve_spent(sig):
+    """Write the approval as spent BEFORE the action runs (fsync, bounded retries). If the record
+    cannot be written the caller must not run: raises."""
+    with home_lock():
+        cur = spent_load()
+        if sig in cur:
+            raise Refused("this approval is already recorded as spent")
+        cur[sig] = now_utc()
+        try:
+            spent_write(cur)
+        except (LoomError, OSError) as e:
+            raise LoomError("cannot record the approval as spent (%s): refusing to run, nothing was run"
+                            % e.__class__.__name__)
+
+
+def release_spent(sig):
+    """The action failed before it did anything the approval covers: give the approval back."""
     try:
-        cur = home_json("spent.json", {"sigs": []}).get("sigs", [])
-        cur = [x for x in cur if isinstance(x, str)][-4000:] + [sig]
-        write_home_json("spent.json", {"schema": SCHEMA, "sigs": cur})
+        with home_lock():
+            cur = spent_load()
+            if sig in cur:
+                del cur[sig]
+                spent_write(cur)
     except (LoomError, OSError):
-        pass
+        pass  # stays spent: the user approves again (fail closed)
 
 
 def env_allow():
@@ -1091,15 +1243,199 @@ def resolved_programs(root, cfg):
     return out_
 
 
-def trust_hash(root, cfg):
+def static_argv(argv, commands):
+    """argv with {python} and {cmd:NAME} expanded; runtime placeholders ({item}, {channel}, ...)
+    stay as written. This is what the user reviews and what is pinned."""
+    res = []
+    for t in argv:
+        m = PH_RE.match(t)
+        if m and m.group(1) == "python":
+            res.append(sys.executable)
+        elif m and m.group(1) == "cmd":
+            res.extend(static_argv(commands[m.group(2)], {}))
+        else:
+            res.append(t)
+    return res
+
+
+PY_NAME_RE = re.compile(r"^(python|pythonw|python\d+(\.\d+)*[dmu]?w?|pypy\d*|py)\Z")
+PY_NOARG = frozenset("BEIOsSubdqvPRixVh?")
+MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
+
+
+def program_sha(prog):
+    """Identity of the program file: SHA-256 of its content (None if it does not exist)."""
+    try:
+        if not os.path.isfile(prog):
+            return None
+        return sha256_file(os.path.realpath(prog))
+    except (OSError, ValueError):
+        return "unreadable"
+
+
+def pin_path(root, tok):
+    """(key, sha256 or None) for a script or data file named in an argv. A path inside the
+    project goes through the usual path rules; an absolute path is taken as written."""
+    if os.path.isabs(tok):
+        p = os.path.realpath(tok)
+        key = os.path.normcase(os.path.abspath(tok)).replace("\\", "/")
+    else:
+        p = abs_in(root, tok)
+        key = tok
+    if os.path.isfile(p):
+        return key, sha256_file(p)
+    return key, None
+
+
+def pin_module(root, mod, files):
+    """Pin every file the project could supply for `python -m mod`, and pin the ABSENCE of the
+    ones that are not there (a file planted later changes the pin)."""
+    parts = mod.split(".")
+    for k in range(len(parts)):
+        rel = "/".join(parts[:k + 1])
+        cands = [rel + ".py", rel + "/__init__.py"]
+        if k == len(parts) - 1:
+            cands.append(rel + "/__main__.py")
+        for c in cands:
+            key, val = pin_path(root, c)
+            files[key] = val
+        parent = os.path.join(root, *parts[:k]) if k else root
+        base = parts[k]
+        if os.path.isdir(parent) and not is_link(parent):
+            for name in sorted(os.listdir(parent)):
+                if name != base + ".py" and (name == base or name.startswith(base + ".")) \
+                        and os.path.isfile(os.path.join(parent, name)):
+                    key = "/".join(parts[:k] + [name])
+                    files[key] = sha256_file(os.path.join(parent, name))
+
+
+def analyse_python(root, args, files, notes, problems):
+    """Read the interpreter options we understand; pin the script or the -m module; inline code
+    (-c) is allowed because the whole argv is pinned verbatim. Anything else is refused.
+    Returns how many leading args were consumed."""
+    i, n = 0, len(args)
+    while i < n:
+        t = args[i]
+        if t == "--":
+            i += 1
+            break
+        if t == "-" or not t.startswith("-"):
+            break
+        if t.startswith("--"):
+            problems.append("interpreter option %s is not supported by the pin" % t[:40])
+            return n
+        body, j = t[1:], 0
+        while j < len(body):
+            c = body[j]
+            if c in "cmWX":
+                rest = body[j + 1:]
+                if rest:
+                    arg = rest
+                else:
+                    i += 1
+                    if i >= n:
+                        problems.append("option -%s needs a value" % c)
+                        return n
+                    arg = args[i]
+                if c == "c":
+                    notes.append("inline code (-c): pinned verbatim, shown in full in the argv line")
+                    return i + 1
+                if c == "m":
+                    if not MODULE_RE.match(arg):
+                        problems.append("-m module name %r is not a plain dotted name" % arg[:60])
+                    else:
+                        notes.append("module %s: project files pinned (and their absence)" % arg)
+                        pin_module(root, arg, files)
+                    return i + 1
+                break  # -W / -X: the value is consumed, no code involved
+            if c in PY_NOARG:
+                j += 1
+                continue
+            problems.append("interpreter option -%s is not supported by the pin" % c)
+            return n
+        i += 1
+    if i < n:
+        tok = args[i]
+        if PH_RE.match(tok):
+            problems.append("the script path is a placeholder (%s) and cannot be pinned" % tok[:40])
+        else:
+            key, val = pin_path(root, tok)
+            files[key] = val
+            notes.append("script %s: content pinned" % key)
+        return i + 1
+    return i
+
+
+def pin_files_in(root, args, files):
+    """Any other argument that names an existing file inside the project is pinned too."""
+    for t in args:
+        if not t or t.startswith("-") or PH_RE.match(t) or "{" in t:
+            continue
+        try:
+            if os.path.isabs(t):
+                continue
+            p = abs_in(root, t)
+        except LoomError:
+            continue
+        if os.path.isfile(p):
+            files[t] = sha256_file(p)
+
+
+def pin_entries(root, cfg):
+    """One record per command: label, spec, expanded argv, program path and identity, pinned
+    files, notes and problems (a problem means `trust --yes` refuses to pin it)."""
     cmds = cfg.get("commands", {})
-    specs = []
-    for (label, spec), (_, prog) in zip(command_specs(cfg), resolved_programs(root, cfg)):
-        specs.append([label, spec, os.path.normcase(prog)])
-    payload = {"v": 1, "root": root_key(root), "pack": cfg.get("pack"),
-               "channels": cfg.get("channels", []), "commands": cmds, "specs": specs}
+    progs = dict(resolved_programs(root, cfg))
+    res = []
+    for label, spec in command_specs(cfg):
+        prog = progs[label]
+        argv = static_argv(spec["argv"], cmds)
+        e = {"label": label, "spec": spec, "argv": argv, "program": os.path.normcase(prog),
+             "program_sha": program_sha(prog), "files": {}, "notes": [], "problems": []}
+        shown = json.dumps(argv, ensure_ascii=False)
+        if len(shown) > ARGV_PRINT_MAX:
+            e["problems"].append("the argv is %d characters, over the %d that the review can show in "
+                                 "full: refusing to pin it (move the code into a script file)"
+                                 % (len(shown), ARGV_PRINT_MAX))
+        args = argv[1:]
+        used = 0
+        try:
+            name = os.path.basename(prog).casefold()
+            if name.endswith(".exe"):
+                name = name[:-4]
+            if PY_NAME_RE.match(name):
+                if name == "py":
+                    while args and re.match(r"^-\d+(\.\d+)?(-\d+)?\Z", args[0]):
+                        args = args[1:]
+                used = analyse_python(root, args, e["files"], e["notes"], e["problems"])
+            pin_files_in(root, args[used:], e["files"])
+        except LoomError as ex:
+            e["problems"].append("a file named in the command is refused: %s" % ex)
+        res.append(e)
+    return res
+
+
+def trust_payload(root, cfg, entries):
+    return {"v": PIN_VERSION, "root": root_key(root), "config": cfg, "entries": entries}
+
+
+def pin_hash_of(payload):
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return sha256_bytes(raw.encode("ascii"))
+
+
+def trust_hash(root, cfg):
+    return pin_hash_of(trust_payload(root, cfg, pin_entries(root, cfg)))
+
+
+def compact_record(root, cfg, entries):
+    return {"hash": pin_hash_of(trust_payload(root, cfg, entries)),
+            "config_sha": pin_hash_of({"config": cfg}), "version": VERSION,
+            "entries": [{"label": e["label"], "argv": e["argv"], "program": e["program"],
+                         "program_sha": e["program_sha"], "files": e["files"],
+                         "env": list(e["spec"].get("env", [])),
+                         "settings": dict((k, v) for k, v in e["spec"].items() if k not in ("argv", "env"))}
+                        for e in entries]}
 
 
 def trust_recorded(root):
@@ -1108,34 +1444,96 @@ def trust_recorded(root):
     return p.get(root_key(root)) if isinstance(p, dict) else None
 
 
+def short_json(v, n=160):
+    return clean(json.dumps(v, ensure_ascii=False), n)
+
+
+def pin_diff(old, new):
+    """What changed between the recorded pin and the current state, one line each."""
+    lines = []
+    olds = dict((e["label"], e) for e in old.get("entries", []) if isinstance(e, dict) and "label" in e)
+    news = dict((e["label"], e) for e in new.get("entries", []))
+    for label in sorted(set(olds) | set(news)):
+        o, n = olds.get(label), news.get(label)
+        if o is None:
+            lines.append("new command: %s" % label)
+            continue
+        if n is None:
+            lines.append("command removed: %s" % label)
+            continue
+        if o.get("argv") != n["argv"]:
+            lines.append("%s: argv changed, was %s, now %s" % (label, short_json(o.get("argv")), short_json(n["argv"])))
+        if o.get("program") != n["program"]:
+            lines.append("%s: the program found on PATH changed (a different shell or PATH order can do "
+                         "this), was %s, now %s" % (label, clean(str(o.get("program")), 200), clean(n["program"], 200)))
+        elif o.get("program_sha") != n["program_sha"]:
+            lines.append("%s: the program file at %s changed (its content)" % (label, clean(n["program"], 200)))
+        of, nf = o.get("files") or {}, n["files"]
+        for k in sorted(set(of) | set(nf)):
+            if of.get(k) != nf.get(k):
+                what = "appeared" if of.get(k) is None else (
+                    "was removed" if nf.get(k) is None else "content changed")
+                lines.append("%s: pinned file %s %s" % (label, clean(k, 120), what))
+        if list(o.get("env") or []) != list(n["env"]):
+            lines.append("%s: env names changed, was %s, now %s" % (label, short_json(o.get("env")), short_json(n["env"])))
+        ns = dict((k, v) for k, v in n["settings"].items()) if "settings" in n else {}
+        if (o.get("settings") or {}) != ns:
+            lines.append("%s: settings changed (timeout, pass codes, allowed stages or similar)" % label)
+    if not lines and old.get("config_sha") != new.get("config_sha"):
+        lines.append("stages, checks, channels or other settings of the config changed")
+    if not lines and old.get("hash") != new.get("hash"):
+        lines.append("something else in the pinned state changed")
+    return lines
+
+
 def require_trust(root, cfg, what):
-    cur = trust_hash(root, cfg)
+    entries = pin_entries(root, cfg)
     rec = trust_recorded(root)
     if rec is None:
         raise Refused("the commands in loom.config.json are not trusted yet, so %s will not run them. "
-                      "Review them with `trust` (it prints every command), then run `trust --yes`" % what)
-    if not isinstance(rec, str) or not hmac.compare_digest(rec, cur):
-        raise Refused("the commands in loom.config.json changed since you trusted them (or the "
-                      "program they resolve to changed), so %s refuses. Review them with `trust`, "
-                      "then run `trust --yes` again" % what)
+                      "Review them with `trust` (it prints every command in full and writes nothing); "
+                      "the pin is written only by a separate, deliberate confirmation" % what)
+    if not isinstance(rec, dict):
+        raise Refused("the pin for this folder was written by an older loom and has no detail to compare: "
+                      "review the commands again with `trust` before %s runs anything" % what)
+    new = compact_record(root, cfg, entries)
+    bad = [p for e in entries for p in e["problems"]]
+    if bad or not isinstance(rec.get("hash"), str) or not hmac.compare_digest(rec["hash"], new["hash"]):
+        ex = Refused("the commands, the programs or the script files they run changed since you trusted "
+                     "them, so %s refuses. Read what changed (also printed below) with `trust`; "
+                     "confirming a pin without reading it defeats the pin" % what)
+        ex.details = (bad or []) + pin_diff(rec, new)
+        raise ex
 
 
 def cmd_trust(args):
     root = root_of(args)
     cfg = load_config(root)
-    ensure_home_ok = home_dir(root)
+    home_dir(root)
     out("loom trust for %s" % root)
     out("These commands run WITHOUT a prompt when a pre-approved `gate` or an approved build/stage/"
-        "publish/schedule starts them, with your user rights.")
-    specs = command_specs(cfg)
-    progs = dict(resolved_programs(root, cfg))
+        "publish/schedule starts them, with your user rights. Scripts they run, and modules run with "
+        "-m from this folder, are pinned by content: editing one needs a new trust.")
+    entries = pin_entries(root, cfg)
     allow = env_allow()
-    if not specs:
+    if not entries:
         out("(no commands are configured)")
-    for label, spec in specs:
-        out("- %s" % label, 2000)
-        out("    argv: %s" % " ".join(spec["argv"]), 4000)
-        out("    program: %s" % progs.get(label), 1000)
+    problems = []
+    for e in entries:
+        spec = e["spec"]
+        out("- %s" % e["label"], 2000)
+        written = json.dumps(spec["argv"], ensure_ascii=False)
+        out("    argv: %s" % json.dumps(e["argv"], ensure_ascii=False), 10 ** 5)
+        out("    as written in the config (named commands not expanded): %s" % written, 10 ** 5)
+        out("    program: %s" % e["program"], 2000)
+        out("    program file sha256: %s" % e["program_sha"], 200)
+        for k in sorted(e["files"]):
+            out("    pinned file: %s sha256 %s" % (k, e["files"][k] or "(absent: its absence is pinned)"), 600)
+        for note in e["notes"]:
+            out("    note: %s" % note, 600)
+        for p in e["problems"]:
+            out("    PROBLEM: %s" % p, 1000)
+            problems.append("%s: %s" % (e["label"], p))
         out("    timeout: %ss; max_output: %s; pass_codes: %s" % (
             spec.get("timeout", 60), spec.get("max_output", 20000), spec.get("pass_codes", [0])))
         names = spec.get("env", [])
@@ -1145,22 +1543,37 @@ def cmd_trust(args):
                 ", ".join(n for n in names if n in allow) or "none"), 2000)
         if "allowed_stages" in spec:
             out("    allowed_stages: %s" % ", ".join(spec["allowed_stages"]))
-    if cfg.get("commands"):
-        out("named commands: %s" % ", ".join(sorted(cfg["commands"])))
-    h = trust_hash(root, cfg)
+    for name in sorted(cfg.get("commands", {})):
+        out("named command %s = %s" % (name, json.dumps(cfg["commands"][name], ensure_ascii=False)), 10 ** 5)
+    rec_new = compact_record(root, cfg, entries)
+    h = rec_new["hash"]
     out("pin: %s" % h[:16])
     cur = trust_recorded(root)
-    out("status: %s" % ("already trusted" if cur == h else (
-        "NOT trusted (changed since last trust)" if cur else "NOT trusted")))
+    cur_hash = cur.get("hash") if isinstance(cur, dict) else None
+    if cur_hash == h:
+        out("status: already trusted")
+    elif isinstance(cur, dict):
+        out("status: NOT trusted (changed since last trust). What changed:")
+        for ln in pin_diff(cur, rec_new)[:30]:
+            out("  - %s" % ln, 700)
+    elif cur:
+        out("status: NOT trusted (the old pin has no detail to compare)")
+    else:
+        out("status: NOT trusted")
+    if problems:
+        raise Refused("some commands cannot be pinned (see the PROBLEM lines): fix the config first")
     if not args.yes:
-        out("Nothing was written. After you have reviewed the commands above, run: trust --yes")
+        out("Nothing was written. Read every argv, program and pinned file above; "
+            "the pin is written only by running trust again with --yes after you have done that.")
         return 0
-    d = home_json("trust.json", {"projects": {}})
-    proj = d.get("projects", {})
-    need(isinstance(proj, dict), "trust.json is damaged")
-    proj[root_key(root)] = h
-    write_home_json("trust.json", {"schema": SCHEMA, "projects": proj})
-    out("trusted: these exact commands (and the programs they resolve to) are pinned for this folder")
+    with home_lock():
+        d = home_json("trust.json", {"projects": {}})
+        proj = d.get("projects", {})
+        need(isinstance(proj, dict), "trust.json is damaged")
+        proj[root_key(root)] = rec_new
+        write_home_json("trust.json", {"schema": SCHEMA, "projects": proj})
+    out("trusted: these exact commands, the programs they resolve to and the script files they run "
+        "are pinned for this folder")
     return 0
 
 
@@ -1254,7 +1667,7 @@ def strip_invisible(text):
             keep.append(ch)
         elif ch == "\t":
             keep.append(" ")
-        elif unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"):
+        elif not is_invisible(ch):
             keep.append(ch)
     return "".join(keep)
 
@@ -1348,8 +1761,10 @@ def _kill_tree(proc, job):
         if job is not None:
             job.kill()
         elif os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            tool = system_tool("taskkill")  # absolute system path; never found through PATH or cwd
+            subprocess.run([tool, "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+                           cwd=os.path.dirname(tool))
         else:
             os.killpg(proc.pid, signal.SIGKILL)
     except Exception:
@@ -1747,15 +2162,16 @@ def manifest_mac(root, raw):
 def record_manifest_mac(root, raw):
     mac = manifest_mac(root, raw)
     need(mac, "no secret key yet")
-    d = home_json("manifests.json", {"roots": {}})
-    roots = d.get("roots", {})
-    need(isinstance(roots, dict), "manifests.json is damaged")
-    cur = roots.get(root_key(root), [])
-    cur = [x for x in cur if isinstance(x, str)][-3:] if isinstance(cur, list) else []
-    if mac not in cur:
-        cur.append(mac)
-    roots[root_key(root)] = cur
-    write_home_json("manifests.json", {"schema": SCHEMA, "roots": roots})
+    with home_lock():  # read-modify-write: parallel installs in other projects must not lose a record
+        d = home_json("manifests.json", {"roots": {}})
+        roots = d.get("roots", {})
+        need(isinstance(roots, dict), "manifests.json is damaged")
+        cur = roots.get(root_key(root), [])
+        cur = [x for x in cur if isinstance(x, str)][-3:] if isinstance(cur, list) else []
+        if mac not in cur:
+            cur.append(mac)
+        roots[root_key(root)] = cur
+        write_home_json("manifests.json", {"schema": SCHEMA, "roots": roots})
 
 
 def manifest_verified(root, raw):
@@ -2216,11 +2632,48 @@ def advice(root, cfg, it):
         if g is None:
             return "gate", why
         return "blocked", "%s: %s" % (why, g.get("detail", ""))
+    if publish_pending(cfg, it):
+        # `advance` here would close the item without publishing it: point at the real step
+        if any_publish_approval(root, it, cfg.get("approval_ttl_hours", 72)):
+            return "publish", ("approved: run publish --dry-run, then publish (or schedule) with the "
+                               "approved channel; do not advance, that closes the item unpublished")
+        return "blocked", ("needs your approval for publish or schedule (approve --what publish "
+                           "--channel <channel>), then publish; do not advance, that closes the item "
+                           "unpublished")
     if st.get("requires_approval"):
         need_ = "advance:" + st["name"]
         if find_approval(root, it, need_, "none", "now", cfg.get("approval_ttl_hours", 72)) is None:
             return "blocked", "needs your approval (%s) recorded with approve" % need_
     return "advance", "gate ok; ready to advance"
+
+
+def publish_pending(cfg, it):
+    """True at the publish stage when a publish or schedule adapter exists, loom is not in shadow
+    mode and nothing was published for this item yet."""
+    if cfg.get("shadow_mode"):
+        return False
+    ads = cfg.get("adapters", {})
+    if not (ads.get("publish") or ads.get("schedule")):
+        return False
+    names = stage_names(cfg, it)
+    if it["stage"] != ("publish" if "publish" in names else names[-1]):
+        return False
+    return not any(e.get("action") in ("publish", "schedule") and e.get("result") == "ok"
+                   for e in it.get("events", []))
+
+
+def any_publish_approval(root, it, ttl_hours):
+    now = parse_ts(now_utc())
+    spent = spent_sigs()
+    for a in it["approvals"]:
+        if a.get("used") or a["what"] not in ("publish", "schedule") or a.get("sig") in spent:
+            continue
+        if not approval_valid(root, it["id"], a):
+            continue
+        age = (now - parse_ts(a["date"])).total_seconds()
+        if -300 <= age <= ttl_hours * 3600:
+            return True
+    return False
 
 
 def cmd_next(args):
@@ -2262,7 +2715,9 @@ def cmd_gate(args):
     has_cmd = any(c["type"] == "command" for c in stage.get("checks", []))
     cfg_path = abs_in(root, CONFIG_REL)
     cfg_before = sha256_file(cfg_path)
-    if has_cmd:
+    if has_cmd or trust_recorded(root) is not None:
+        # a pin exists for this folder: any change to the config or the pinned files refuses,
+        # even for a stage without commands
         require_trust(root, cfg, "gate")
     appr_before = approvals_digest(led)
     ok, detail, command = run_checks(root, cfg, it, stage)
@@ -2405,6 +2860,7 @@ def cmd_advance(args):
                               % (st["name"], it["id"], st["name"]))
             ap["used"] = now_utc()
             spent = ap["sig"]
+            reserve_spent(spent)  # written BEFORE the ledger: a failure here refuses and writes nothing
         idx = names.index(st["name"])
         if idx == len(names) - 1:
             it["status"] = "done"
@@ -2413,9 +2869,12 @@ def cmd_advance(args):
             it["stage"] = names[idx + 1]
             msg = "%s moved %s -> %s" % (it["id"], st["name"], it["stage"])
         capped_append(it["events"], {"date": now_utc(), "action": "advance", "result": "ok", "detail": oneline(msg, 300)})
-        save_ledger(root, led, extra)
-    if spent:
-        record_spent(spent)
+        try:
+            save_ledger(root, led, extra)
+        except BaseException:
+            if spent:
+                release_spent(spent)
+            raise
     out(msg)
     return 0
 
@@ -2503,10 +2962,16 @@ def run_adapter(kind, args):
         program_of(argv[0], root)  # also fails early, before the approval is reserved
         sig = None
         if ap is not None:
-            ap["claimed"] = now_utc()  # reserved while the adapter runs; used only on success
             sig = ap["sig"]
+            reserve_spent(sig)  # reserve, then run, then finalise; if this cannot be written nothing runs
+            ap["claimed"] = now_utc()
         capped_append(it["events"], {"date": now_utc(), "action": kind, "adapter": name, "result": "started"})
-        save_ledger(root, led, extra)
+        try:
+            save_ledger(root, led, extra)
+        except BaseException:
+            if sig is not None:
+                release_spent(sig)
+            raise
     rc, text, to = run_command(argv, root, spec)
     ok = (not to) and rc is not None and rc in spec.get("pass_codes", [0])
     made = []
@@ -2533,8 +2998,8 @@ def run_adapter(kind, args):
             if rel not in it["artifacts"] and len(it["artifacts"]) < 200:
                 it["artifacts"].append(rel)
         save_ledger(root, led, extra)
-    if ok and sig is not None:
-        record_spent(sig)
+    if not ok and sig is not None:
+        release_spent(sig)  # the action did not happen: the approval can be used again
     out_block(text.rstrip())
     out("%s adapter %s: %s" % (kind, name, res))
     return 0 if ok else 2
@@ -2639,6 +3104,8 @@ def main(argv=None):
         return args.func(args) or 0
     except Refused as e:
         err_line("refused: ", str(e))
+        for ln in list(e.details)[:30]:
+            err_line("  ", ln)
         return 2
     except LoomError as e:
         err_line("error: ", str(e))
